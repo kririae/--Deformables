@@ -1,13 +1,13 @@
 import taichi as ti
 import math
 
-ti.init(arch=ti.cpu)
+ti.init(arch=ti.gpu)
 
 # global control
-paused = True
+paused = False
 damping_toggle = ti.field(ti.i32, ())
 curser = ti.Vector.field(2, ti.f32, ())
-picking = ti.field(ti.i32,())
+picking = ti.field(ti.i32, ())
 using_auto_diff = False
 
 # procedurally setting up the cantilever
@@ -31,6 +31,11 @@ PoissonsRatio = ti.field(ti.f32, ())
 LameMu = ti.field(ti.f32, ())
 LameLa = ti.field(ti.f32, ())
 
+# 1 Corotated linear elasticity
+# 2 St. Venant-Kirchhoff
+# 3 Neohookean elasticity
+useModel: int = 2
+
 # time-step size (for simulation, 16.7ms)
 h = 16.7e-3
 # substepping
@@ -51,6 +56,7 @@ triangles = ti.Vector.field(3, ti.i32, N_triangles)
 edges = ti.Vector.field(2, ti.i32, N_edges)
 
 
+@ti.func
 def ij_2_index(i, j): return i * N_y + j
 
 
@@ -58,7 +64,7 @@ def ij_2_index(i, j): return i * N_y + j
 @ti.kernel
 def meshing():
     # setting up triangles
-    for i,j in ti.ndrange(N_x - 1, N_y - 1):
+    for i, j in ti.ndrange(N_x - 1, N_y - 1):
         # triangle id
         tid = (i * (N_y - 1) + j) * 2
         triangles[tid][0] = ij_2_index(i, j)
@@ -94,15 +100,17 @@ def meshing():
             eid = eid_base+i*(N_y-1)+j
             edges[eid] = [ij_2_index(i+1, j), ij_2_index(i, j+1)]
 
+
 @ti.kernel
 def initialize():
     YoungsModulus[None] = 1e6
-    paused = True
+    paused = False
     # init position and velocity
     for i, j in ti.ndrange(N_x, N_y):
         index = ij_2_index(i, j)
         x[index] = ti.Vector([init_x + i * dx, init_y + j * dx])
         v[index] = ti.Vector([0.0, 0.0])
+
 
 @ti.func
 def compute_D(i):
@@ -110,6 +118,7 @@ def compute_D(i):
     b = triangles[i][1]
     c = triangles[i][2]
     return ti.Matrix.cols([x[b] - x[a], x[c] - x[a]])
+
 
 @ti.kernel
 def initialize_elements():
@@ -119,10 +128,13 @@ def initialize_elements():
         elements_V0[i] = ti.abs(Dm.determinant())/2
 
 # ----------------------core-----------------------------
+
+
 @ti.func
 def compute_R_2D(F):
     R, S = ti.polar_decompose(F, ti.f32)
     return R
+
 
 @ti.kernel
 def compute_gradient():
@@ -134,35 +146,81 @@ def compute_gradient():
     for i in range(N_triangles):
         Ds = compute_D(i)
         F = Ds@elements_Dm_inv[i]
-        # co-rotated linear elasticity
-        R = compute_R_2D(F)
+        P = ti.Matrix.identity(dt=ti.f32, n=2)
         Eye = ti.Matrix.cols([[1.0, 0.0], [0.0, 1.0]])
-        # first Piola-Kirchhoff tensor
-        P = 2*LameMu[None]*(F-R) + LameLa[None]*((R.transpose())@F-Eye).trace()*R
-        #assemble to gradient
+
+        # Compute P with different models
+        if ti.static(useModel == 1):
+            # co-rotated linear elasticity
+            R = compute_R_2D(F)
+            # first Piola-Kirchhoff tensor
+            P = 2*LameMu[None]*(F-R) + LameLa[None] * \
+                ((R.transpose())@F-Eye).trace()*R
+        elif ti.static(useModel == 2):
+            # StVK model
+            E = 0.5*(F.transpose()@F - Eye)
+            P = F @ (2*LameMu[None]*E + LameLa[None]*E.trace()*Eye)
+        elif ti.static(useModel == 3):
+            # Isotropic materials necessity
+            # Fp = F.transpose()@F
+            # I1, I2, I3 = Fp.trace(), (Fp@Fp).trace(), F.determinant()**2
+            J, Fp = F.determinant(), F.transpose().inverse()
+            P = LameMu[None]*F - LameMu[None] * \
+                Fp + LameLa[None]*ti.log(J+1e-5)*Fp
+        else:
+            assert(False)
+
+        # assemble to gradient
         H = elements_V0[i] * P @ (elements_Dm_inv[i].transpose())
-        a,b,c = triangles[i][0],triangles[i][1],triangles[i][2]
-        gb = ti.Vector([H[0,0], H[1, 0]])
-        gc = ti.Vector([H[0,1], H[1, 1]])
+        a, b, c = triangles[i][0], triangles[i][1], triangles[i][2]
+        gb = ti.Vector([H[0, 0], H[1, 0]])
+        gc = ti.Vector([H[0, 1], H[1, 1]])
         ga = -gb-gc
         grad[a] += ga
         grad[b] += gb
-        grad[c] += gc     
+        grad[c] += gc
+
 
 @ti.kernel
 def compute_total_energy():
     for i in range(N_triangles):
         Ds = compute_D(i)
         F = Ds @ elements_Dm_inv[i]
-        # co-rotated linear elasticity
-        R = compute_R_2D(F)
         Eye = ti.Matrix.cols([[1.0, 0.0], [0.0, 1.0]])
-        element_energy_density = LameMu[None]*((F-R)@(F-R).transpose()).trace() + 0.5*LameLa[None]*(R.transpose()@F-Eye).trace()**2
+        element_energy_density: ti.f32 = 0.0
 
-        total_energy[None] += element_energy_density * elements_V0[i]   
+        # populate element_energy_density with different models
+        if ti.static(useModel == 1):
+            # co-rotated linear elasticity
+            R = compute_R_2D(F)
+            element_energy_density = LameMu[None]*((F-R)@(F-R).transpose()).trace(
+            ) + 0.5*LameLa[None]*(R.transpose()@F-Eye).trace()**2
+        elif ti.static(useModel == 2):
+            # StVK model
+            E = 0.5*(F.transpose()@F - Eye)
+            element_energy_density = LameMu[None] * \
+                (E.transpose()@E).trace() + LameLa[None]*E.trace()**2
+        elif ti.static(useModel == 3):
+            # Isotropic materials necessity
+            Fp = F.transpose()@F
+            I1, I2, J = Fp.trace(), (Fp@Fp).trace(), F.determinant()
+            element_energy_density = LameMu[None]/2*(
+                I1 - 3) - LameMu[None]*ti.log(J) + LameLa[None]/2*ti.log(J)**2
+        else:
+            assert(False)
+
+        total_energy[None] += element_energy_density * elements_V0[i]
+
 
 @ti.kernel
 def update():
+    """
+    Perform one step of time integration
+    1. Symplectic integration
+        v' = v + dh * (-grad + g)
+        x' = x + dh * v'
+    2. Backward Euler
+    """
     # perform time integration
     for i in range(N):
         # symplectic integration
@@ -182,7 +240,7 @@ def update():
 
     # enforce boundary condition
     for i in range(N):
-        if picking[None]:           
+        if picking[None]:
             r = x[i]-curser[None]
             if r.norm() < curser_radius:
                 x[i] = curser[None]
@@ -192,7 +250,8 @@ def update():
     for j in range(N_y):
         ind = ij_2_index(0, j)
         v[ind] = ti.Vector([0, 0])
-        x[ind] = ti.Vector([init_x, init_y + j * dx])  # rest pose attached to the wall
+        # rest pose attached to the wall
+        x[ind] = ti.Vector([init_x, init_y + j * dx])
 
     for i in range(N):
         if x[i][0] < init_x:
@@ -207,6 +266,7 @@ def updateLameCoeff():
     LameLa[None] = E*nu / ((1+nu)*(1-2*nu))
     LameMu[None] = E / (2*(1+nu))
 
+
 # init once and for all
 meshing()
 initialize()
@@ -216,7 +276,7 @@ updateLameCoeff()
 gui = ti.GUI('Linear FEM', (800, 800))
 while gui.running:
 
-    picking[None]=0
+    picking[None] = 0
 
     # key events
     for e in gui.get_events(ti.GUI.PRESS):
@@ -231,7 +291,8 @@ while gui.running:
             if YoungsModulus[None] <= 0:
                 YoungsModulus[None] = 0
         elif e.key == '8':
-            PoissonsRatio[None] = PoissonsRatio[None]*0.9+0.05 # slowly converge to 0.5
+            PoissonsRatio[None] = PoissonsRatio[None] * \
+                0.9+0.05  # slowly converge to 0.5
             if PoissonsRatio[None] >= 0.499:
                 PoissonsRatio[None] = 0.499
         elif e.key == '7':
@@ -240,13 +301,13 @@ while gui.running:
                 PoissonsRatio[None] = 0
         elif e.key == ti.GUI.SPACE:
             paused = not paused
-        elif e.key =='d' or e.key == 'D':
+        elif e.key == 'd' or e.key == 'D':
             damping_toggle[None] = not damping_toggle[None]
-        elif e.key =='p' or e.key == 'P': # step-forward
+        elif e.key == 'p' or e.key == 'P':  # step-forward
             for i in range(substepping):
                 if using_auto_diff:
-                    total_energy[None]=0
-                    with ti.Tape(total_energy):
+                    total_energy[None] = 0
+                    with ti.ad.Tape(total_energy):
                         compute_total_energy()
                 else:
                     compute_gradient()
@@ -261,8 +322,8 @@ while gui.running:
     if not paused:
         for i in range(substepping):
             if using_auto_diff:
-                total_energy[None]=0
-                with ti.Tape(total_energy):
+                total_energy[None] = 0
+                with ti.ad.Tape(total_energy):
                     compute_total_energy()
             else:
                 compute_gradient()
@@ -279,7 +340,8 @@ while gui.running:
     gui.line((init_x, 0.0), (init_x, 1.0), color=0xFFFFFF, radius=4)
 
     if picking[None]:
-        gui.circle((curser[None][0], curser[None][1]), radius=curser_radius*800, color=0xFF8888)
+        gui.circle((curser[None][0], curser[None][1]),
+                   radius=curser_radius*800, color=0xFF8888)
 
     # text
     gui.text(
