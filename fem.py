@@ -1,7 +1,11 @@
 import taichi as ti
+from typing import Callable
+import numpy as np
 import math
+import scipy.sparse.linalg as linalg
 
-ti.init(arch=ti.gpu)
+ti.init(arch=ti.cuda, kernel_profiler=True, debug=True)
+
 
 # global control
 paused = False
@@ -9,19 +13,18 @@ damping_toggle = ti.field(ti.i32, ())
 curser = ti.Vector.field(2, ti.f32, ())
 picking = ti.field(ti.i32, ())
 using_auto_diff = False
+using_implicit = False
 
 # procedurally setting up the cantilever
 init_x, init_y = 0.1, 0.6
 N_x = 20
 N_y = 4
-# N_x = 2
-# N_y = 2
 N = N_x*N_y
 N_edges = (N_x-1)*N_y + N_x*(N_y - 1) + (N_x-1) * \
     (N_y-1)  # horizontal + vertical + diagonal springs
 N_triangles = 2 * (N_x-1) * (N_y-1)
-dx = 1/32
-curser_radius = dx/2
+spacing = 1/32
+curser_radius = spacing/2
 
 # physical quantities
 m = 1
@@ -34,12 +37,12 @@ LameLa = ti.field(ti.f32, ())
 # 1 Corotated linear elasticity
 # 2 St. Venant-Kirchhoff
 # 3 Neohookean elasticity
-useModel: int = 2
+using_model: int = 3
 
 # time-step size (for simulation, 16.7ms)
 h = 16.7e-3
 # substepping
-substepping = 100
+substepping = 50
 # time-step size (for time integration)
 dh = h/substepping
 
@@ -47,9 +50,14 @@ dh = h/substepping
 x = ti.Vector.field(2, ti.f32, N, needs_grad=True)
 v = ti.Vector.field(2, ti.f32, N)
 total_energy = ti.field(ti.f32, (), needs_grad=True)
-grad = ti.Vector.field(2, ti.f32, N)
+force = ti.Vector.field(2, ti.f32, N)
 elements_Dm_inv = ti.Matrix.field(2, 2, ti.f32, N_triangles)
 elements_V0 = ti.field(ti.f32, N_triangles)
+
+# implicit integration
+dx = ti.Vector.field(2, ti.f32, N)
+grad_f = ti.Vector.field(2, ti.f32, N)
+displacement = ti.Vector.field(2, ti.f32, N)
 
 # geometric components
 triangles = ti.Vector.field(3, ti.i32, N_triangles)
@@ -108,7 +116,7 @@ def initialize():
     # init position and velocity
     for i, j in ti.ndrange(N_x, N_y):
         index = ij_2_index(i, j)
-        x[index] = ti.Vector([init_x + i * dx, init_y + j * dx])
+        x[index] = ti.Vector([init_x + i * spacing, init_y + j * spacing])
         v[index] = ti.Vector([0.0, 0.0])
 
 
@@ -118,6 +126,14 @@ def compute_D(i):
     b = triangles[i][1]
     c = triangles[i][2]
     return ti.Matrix.cols([x[b] - x[a], x[c] - x[a]])
+
+
+@ti.func
+def compute_dD(i):
+    a = triangles[i][0]
+    b = triangles[i][1]
+    c = triangles[i][2]
+    return ti.Matrix.cols([dx[b] - dx[a], dx[c] - dx[a]])
 
 
 @ti.kernel
@@ -132,106 +148,152 @@ def initialize_elements():
 
 @ti.func
 def compute_R_2D(F):
-    R, S = ti.polar_decompose(F, ti.f32)
+    R, _ = ti.polar_decompose(F, ti.f32)
     return R
 
 
 @ti.kernel
 def compute_gradient():
+    Eye = ti.Matrix.cols([[1.0, 0.0], [0.0, 1.0]]).cast(ti.f32)
+
     # clear gradient
-    for i in grad:
-        grad[i] = ti.Vector([0, 0])
+    for i in force:
+        force[i] = ti.Vector([0, 0])
 
     # gradient of elastic potential
     for i in range(N_triangles):
         Ds = compute_D(i)
         F = Ds@elements_Dm_inv[i]
         P = ti.Matrix.identity(dt=ti.f32, n=2)
-        Eye = ti.Matrix.cols([[1.0, 0.0], [0.0, 1.0]])
 
         # Compute P with different models
-        if ti.static(useModel == 1):
-            # co-rotated linear elasticity
+        if ti.static(using_model == 1):
+            # co-rotated linear elasticity model
             R = compute_R_2D(F)
             # first Piola-Kirchhoff tensor
             P = 2*LameMu[None]*(F-R) + LameLa[None] * \
                 ((R.transpose())@F-Eye).trace()*R
-        elif ti.static(useModel == 2):
+        elif ti.static(using_model == 2):
             # StVK model
             E = 0.5*(F.transpose()@F - Eye)
             P = F @ (2*LameMu[None]*E + LameLa[None]*E.trace()*Eye)
-        elif ti.static(useModel == 3):
-            # Isotropic materials necessity
-            # Fp = F.transpose()@F
-            # I1, I2, I3 = Fp.trace(), (Fp@Fp).trace(), F.determinant()**2
+        elif ti.static(using_model == 3):
+            # Neohookean model
             J, Fp = F.determinant(), F.transpose().inverse()
             P = LameMu[None]*F - LameMu[None] * \
                 Fp + LameLa[None]*ti.log(J+1e-5)*Fp
         else:
-            assert(False)
+            assert False, "model not implemented"
 
         # assemble to gradient
-        H = elements_V0[i] * P @ (elements_Dm_inv[i].transpose())
+        H = -elements_V0[i] * P @ (elements_Dm_inv[i].transpose())
         a, b, c = triangles[i][0], triangles[i][1], triangles[i][2]
         gb = ti.Vector([H[0, 0], H[1, 0]])
         gc = ti.Vector([H[0, 1], H[1, 1]])
         ga = -gb-gc
-        grad[a] += ga
-        grad[b] += gb
-        grad[c] += gc
+        force[a] += ga
+        force[b] += gb
+        force[c] += gc
 
 
 @ti.kernel
 def compute_total_energy():
+    Eye = ti.Matrix.cols([[1.0, 0.0], [0.0, 1.0]]).cast(ti.f32)
+
     for i in range(N_triangles):
         Ds = compute_D(i)
         F = Ds @ elements_Dm_inv[i]
-        Eye = ti.Matrix.cols([[1.0, 0.0], [0.0, 1.0]])
         element_energy_density: ti.f32 = 0.0
 
         # populate element_energy_density with different models
-        if ti.static(useModel == 1):
-            # co-rotated linear elasticity
+        if ti.static(using_model == 1):
+            # co-rotated linear elasticity model
             R = compute_R_2D(F)
             element_energy_density = LameMu[None]*((F-R)@(F-R).transpose()).trace(
             ) + 0.5*LameLa[None]*(R.transpose()@F-Eye).trace()**2
-        elif ti.static(useModel == 2):
+        elif ti.static(using_model == 2):
             # StVK model
             E = 0.5*(F.transpose()@F - Eye)
             element_energy_density = LameMu[None] * \
                 (E.transpose()@E).trace() + LameLa[None]*E.trace()**2
-        elif ti.static(useModel == 3):
-            # Isotropic materials necessity
+        elif ti.static(using_model == 3):
+            # Neohookean model
             Fp = F.transpose()@F
-            I1, I2, J = Fp.trace(), (Fp@Fp).trace(), F.determinant()
+            I1, _, J = Fp.trace(), (Fp@Fp).trace(), F.determinant()
             element_energy_density = LameMu[None]/2*(
                 I1 - 3) - LameMu[None]*ti.log(J) + LameLa[None]/2*ti.log(J)**2
         else:
-            assert(False)
+            assert False, "model not implemented"
 
         total_energy[None] += element_energy_density * elements_V0[i]
 
 
 @ti.kernel
+def compute_force_differential():
+    """Given delta_x, compute the force differential and write into grad_f"""
+    Eye = ti.Matrix.cols([[1.0, 0.0], [0.0, 1.0]]).cast(ti.f32)
+
+    # clear gradient
+    for i in grad_f:
+        grad_f[i] = ti.Vector([0, 0])
+
+    for i in range(N):
+        Ds, dDs = compute_D(i), compute_dD(i)
+        F, dF = Ds@elements_Dm_inv[i], dDs@elements_Dm_inv[i]
+        E = 0.5*(F.transpose()@F - Eye)
+        dE = 0.5*(dF.transpose()@F + F.transpose()@dF)
+        dP = ti.Matrix.identity(dt=ti.f32, n=2)
+
+        if ti.static(using_model == 1):
+            # co-rotated linear elasticity model
+            assert False, "implicit integration cannot be used with co-rotated linear elasticity model"
+        elif ti.static(using_model == 2):
+            # StVK model
+            dP = dF@(2*LameMu[None]*E + LameLa[None]*E.trace()*Eye) + \
+                F@(2*LameMu[None]*dE + LameLa[None]*dE.trace()*Eye)
+        elif ti.static(using_model == 3):
+            # Neohookean model
+            Fp = F.inverse()
+            J = F.determinant()
+            dP = LameMu[None]*dF + (LameMu[None] - LameLa[None]*ti.log(
+                J)) * Fp @ dF @ Fp + LameLa[None] * (Fp @ dF).trace() * Fp.transpose()
+
+        dH = -elements_V0[i] * dP @ elements_Dm_inv[i].transpose()
+        a, b, c = triangles[i][0], triangles[i][1], triangles[i][2]
+        gb = ti.Vector([dH[0, 0], dH[1, 0]])
+        gc = ti.Vector([dH[0, 1], dH[1, 1]])
+        ga = -(gb + gc)
+        grad_f[a] += ga
+        grad_f[b] += gb
+        grad_f[c] += gc
+
+
+def compute_displacement():
+    def semi_implicit_matvec(x: np.ndarray) -> np.ndarray:
+        dx.from_numpy(x.reshape(-1, 2))
+        compute_force_differential()
+        return m/dh**2 * x - grad_f.to_numpy().reshape(-1)
+
+    b = (m/dh*v.to_numpy() + force.to_numpy() - np.array([0.0, g])).reshape(-1)
+    op = linalg.LinearOperator((N*2, N*2), semi_implicit_matvec)
+    x, _ = linalg.cg(op, b, maxiter=3, atol=1e-5)
+    displacement.from_numpy(x.reshape(-1, 2))
+
+
+@ti.kernel
 def update():
-    """
-    Perform one step of time integration
-    1. Symplectic integration
-        v' = v + dh * (-grad + g)
-        x' = x + dh * v'
-    2. Backward Euler
-    """
     # perform time integration
     for i in range(N):
-        # symplectic integration
         # elastic force + gravitation force, divding mass to get the acceleration
-        if using_auto_diff:
+        if ti.static(using_implicit):
+            v[i] = displacement[i]/dh
+        elif ti.static(using_auto_diff):
             acc = -x.grad[i]/m - ti.Vector([0.0, g])
             v[i] += dh*acc
         else:
-            acc = -grad[i]/m - ti.Vector([0.0, g])
+            acc = force[i]/m - ti.Vector([0.0, g])
             v[i] += dh*acc
-        x[i] += dh*v[i]
+        x[i] += v[i]*dh
 
     # explicit damping (ether drag)
     for i in v:
@@ -251,7 +313,7 @@ def update():
         ind = ij_2_index(0, j)
         v[ind] = ti.Vector([0, 0])
         # rest pose attached to the wall
-        x[ind] = ti.Vector([init_x, init_y + j * dx])
+        x[ind] = ti.Vector([init_x, init_y + j * spacing])
 
     for i in range(N):
         if x[i][0] < init_x:
@@ -311,6 +373,8 @@ while gui.running:
                         compute_total_energy()
                 else:
                     compute_gradient()
+                if using_implicit:
+                    compute_displacement()
                 update()
         updateLameCoeff()
 
@@ -327,6 +391,8 @@ while gui.running:
                     compute_total_energy()
             else:
                 compute_gradient()
+            if using_implicit:
+                compute_displacement()
             update()
 
     # render
@@ -355,3 +421,5 @@ while gui.running:
         gui.text(
             content='D: Damping Off', pos=(0.6, 0.85), color=0xFFFFFF)
     gui.show()
+
+ti.profiler.print_kernel_profiler_info()
