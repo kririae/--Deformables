@@ -153,13 +153,11 @@ def update():
 
     # enforce boundary condition
     for i in range(N):
-        if picking[None]:           
+        if picking[None]:   
             r = x[i]-curser[None]
             if r.norm() < curser_radius:
                 x[i] = curser[None]
                 v[i] = ti.Vector([0.0, 0.0])
-                pass
-
     for j in range(N_y):
         ind = ij_2_index(0, j)
         v[ind] = ti.Vector([0, 0])
@@ -193,10 +191,10 @@ while gui.running:
             YoungsModulus[None] /= 1.1
         elif e.key == ti.GUI.SPACE:
             paused = not paused
-        elif e.key =='d' or e.key == 'D':
+        elif e.key in ['d', 'D']:
             damping_toggle[None] = not damping_toggle[None]
-        elif e.key == 'p' or e.key == 'P':
-            for i in range(substepping):
+        elif e.key in ['p', 'P']:
+            for _ in range(substepping):
                 compute_gradient()
                 update()           
 
@@ -206,7 +204,7 @@ while gui.running:
 
     # numerical time integration
     if not paused:
-        for i in range(substepping):
+        for _ in range(substepping):
             compute_gradient()
             update()
 

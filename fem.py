@@ -307,8 +307,6 @@ def update():
             if r.norm() < curser_radius:
                 x[i] = curser[None]
                 v[i] = ti.Vector([0.0, 0.0])
-                pass
-
     for j in range(N_y):
         ind = ij_2_index(0, j)
         v[ind] = ti.Vector([0, 0])
@@ -350,23 +348,20 @@ while gui.running:
             YoungsModulus[None] *= 1.1
         elif e.key == '9':
             YoungsModulus[None] /= 1.1
-            if YoungsModulus[None] <= 0:
-                YoungsModulus[None] = 0
+            YoungsModulus[None] = max(YoungsModulus[None], 0)
         elif e.key == '8':
             PoissonsRatio[None] = PoissonsRatio[None] * \
                 0.9+0.05  # slowly converge to 0.5
-            if PoissonsRatio[None] >= 0.499:
-                PoissonsRatio[None] = 0.499
+            PoissonsRatio[None] = min(PoissonsRatio[None], 0.499)
         elif e.key == '7':
             PoissonsRatio[None] = PoissonsRatio[None]*1.1-0.05
-            if PoissonsRatio[None] <= 0:
-                PoissonsRatio[None] = 0
+            PoissonsRatio[None] = max(PoissonsRatio[None], 0)
         elif e.key == ti.GUI.SPACE:
             paused = not paused
-        elif e.key == 'd' or e.key == 'D':
+        elif e.key in ['d', 'D']:
             damping_toggle[None] = not damping_toggle[None]
-        elif e.key == 'p' or e.key == 'P':  # step-forward
-            for i in range(substepping):
+        elif e.key in ['p', 'P']:  # step-forward
+            for _ in range(substepping):
                 if using_auto_diff:
                     total_energy[None] = 0
                     with ti.ad.Tape(total_energy):
@@ -384,7 +379,7 @@ while gui.running:
 
     # numerical time integration
     if not paused:
-        for i in range(substepping):
+        for _ in range(substepping):
             if using_auto_diff:
                 total_energy[None] = 0
                 with ti.ad.Tape(total_energy):
