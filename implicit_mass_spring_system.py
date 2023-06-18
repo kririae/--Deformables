@@ -220,8 +220,7 @@ class Cloth:
             self.r[i] = self.b[i] - self.Ax[i]
         for i in range(self.NV):  # d = r
             self.d[i] = self.r[i]
-        delta_new = self.dot(self.r, self.r)
-        return delta_new
+        return self.dot(self.r, self.r)
 
     @ti.kernel
     def run_iteration(self, delta_new: ti.f32) -> ti.f32:
@@ -285,7 +284,7 @@ if __name__ == "__main__":
             elif e.key == gui.SPACE:
                 pause = not pause
         if not pause:
-            for i in range(max_step):
+            for _ in range(max_step):
                 if use_cg:
                     cloth.update_cg(h)
                 else:
